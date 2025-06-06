@@ -215,7 +215,7 @@
 
 #define NVME_MAX_IOQPAIRS 0xffff
 #define NVME_DB_SIZE  4
-#define NVME_SPEC_VER 0x00010400
+#define NVME_SPEC_VER 0x00010300
 #define NVME_CMB_BIR 2
 #define NVME_PMR_BIR 4
 #define NVME_TEMPERATURE 0x143
@@ -5463,7 +5463,7 @@ static uint16_t nvme_get_log(NvmeCtrl *n, NvmeRequest *req)
     off = (lpou << 32ULL) | lpol;
 
     if (off & 0x3) {
-        return NVME_INVALID_FIELD | NVME_DNR;
+        return NVME_INVALID_FIELD | NVME_DNR; // needs to return invalid log page
     }
 
     trace_pci_nvme_get_log(nvme_cid(req), lid, lsp, rae, len, off);
@@ -6275,6 +6275,16 @@ static uint16_t nvme_get_feature(NvmeCtrl *n, NvmeRequest *req)
     uint32_t result = 0;
     uint8_t fid = NVME_GETSETFEAT_FID(dw10);
     NvmeGetFeatureSelect sel = NVME_GETFEAT_SELECT(dw10);
+    int valid_sel[] = {0, 1, 2, 3, 8};
+    bool valid = false;
+    for (int i = 0; i < 5; i++) {
+        if (sel == valid_sel[i]) {
+            valid = true;
+        }
+    } 
+    if (!valid) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
     uint16_t iv;
     NvmeNamespace *ns;
     int i;
@@ -6408,55 +6418,58 @@ static uint16_t nvme_get_feature(NvmeCtrl *n, NvmeRequest *req)
     }
 
 defaults:
-    switch (fid) {
-    case NVME_TEMPERATURE_THRESHOLD:
-        result = 0;
+    if (sel == 1) {
+        result = nvme_feature_default[fid];
+    } else {
+        switch (fid) {
+        case NVME_TEMPERATURE_THRESHOLD:
+            result = 0;
 
-        if (NVME_TEMP_TMPSEL(dw11) != NVME_TEMP_TMPSEL_COMPOSITE) {
+            if (NVME_TEMP_TMPSEL(dw11) != NVME_TEMP_TMPSEL_COMPOSITE) {
+                break;
+            }
+
+            if (NVME_TEMP_THSEL(dw11) == NVME_TEMP_THSEL_OVER) {
+                result = NVME_TEMPERATURE_WARNING;
+            }
+
+            break;
+        case NVME_NUMBER_OF_QUEUES:
+            result = (n->conf_ioqpairs - 1) | ((n->conf_ioqpairs - 1) << 16);
+            trace_pci_nvme_getfeat_numq(result);
+            break;
+        case NVME_INTERRUPT_VECTOR_CONF:
+            iv = dw11 & 0xffff;
+            if (iv >= n->conf_ioqpairs + 1) {
+                return NVME_INVALID_FIELD | NVME_DNR;
+            }
+
+            result = iv;
+            if (iv == n->admin_cq.vector) {
+                result |= NVME_INTVC_NOCOALESCING;
+            }
+            break;
+        case NVME_FDP_MODE:
+            endgrpid = dw11 & 0xff;
+
+            if (endgrpid != 0x1) {
+                return NVME_INVALID_FIELD | NVME_DNR;
+            }
+
+            ret = nvme_get_feature_fdp(n, endgrpid, &result);
+            if (ret) {
+                return ret;
+            }
+            break;
+
+        case NVME_WRITE_ATOMICITY:
+            result = n->dn;
+            break;
+        default:
+            result = nvme_feature_default[fid];
             break;
         }
-
-        if (NVME_TEMP_THSEL(dw11) == NVME_TEMP_THSEL_OVER) {
-            result = NVME_TEMPERATURE_WARNING;
-        }
-
-        break;
-    case NVME_NUMBER_OF_QUEUES:
-        result = (n->conf_ioqpairs - 1) | ((n->conf_ioqpairs - 1) << 16);
-        trace_pci_nvme_getfeat_numq(result);
-        break;
-    case NVME_INTERRUPT_VECTOR_CONF:
-        iv = dw11 & 0xffff;
-        if (iv >= n->conf_ioqpairs + 1) {
-            return NVME_INVALID_FIELD | NVME_DNR;
-        }
-
-        result = iv;
-        if (iv == n->admin_cq.vector) {
-            result |= NVME_INTVC_NOCOALESCING;
-        }
-        break;
-    case NVME_FDP_MODE:
-        endgrpid = dw11 & 0xff;
-
-        if (endgrpid != 0x1) {
-            return NVME_INVALID_FIELD | NVME_DNR;
-        }
-
-        ret = nvme_get_feature_fdp(n, endgrpid, &result);
-        if (ret) {
-            return ret;
-        }
-        break;
-
-    case NVME_WRITE_ATOMICITY:
-        result = n->dn;
-        break;
-    default:
-        result = nvme_feature_default[fid];
-        break;
     }
-
 out:
     req->cqe.result = cpu_to_le32(result);
     return ret;
@@ -8858,7 +8871,7 @@ static void nvme_init_ctrl(NvmeCtrl *n, PCIDevice *pci_dev)
     id->oncs = cpu_to_le16(NVME_ONCS_WRITE_ZEROES | NVME_ONCS_TIMESTAMP |
                            NVME_ONCS_FEATURES | NVME_ONCS_DSM |
                            NVME_ONCS_COMPARE | NVME_ONCS_COPY |
-                           NVME_ONCS_NVMCSA | NVME_ONCS_NVMAFC);
+                           NVME_ONCS_NVMCSA | NVME_ONCS_NVMAFC | NVME_ONCS_VERIFY);
 
     /*
      * NOTE: If this device ever supports a command set that does NOT use 0x0
